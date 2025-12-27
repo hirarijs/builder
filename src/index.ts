@@ -1,10 +1,12 @@
-import { build, Plugin } from 'esbuild';
+import { build, Plugin, formatMessages } from 'esbuild';
 import { readFileSync, existsSync, statSync } from 'fs';
 import path from 'path';
 import { globSync } from 'glob';
 import stripJsonComments from 'strip-json-comments';
 import cac from 'cac';
 import { createMatchPath } from 'tsconfig-paths';
+import { performance } from 'perf_hooks';
+import ts from 'typescript';
 
 const tsconfigPathsPlugin = (options: { tsconfigPath: string }): Plugin => {
   return {
@@ -71,7 +73,71 @@ const tsconfigPathsPlugin = (options: { tsconfigPath: string }): Plugin => {
   };
 };
 
-async function runBuild(options: { project: string }) {
+function moduleToFormat(moduleOption?: string): 'cjs' | 'esm' {
+  if (!moduleOption) return 'cjs'; // Align with TypeScript's default (commonjs)
+  const normalized = moduleOption.toLowerCase();
+  if (normalized.includes('commonjs')) return 'cjs';
+  // Node16/NodeNext produce native ESM output; treat as esm for esbuild.
+  return 'esm';
+}
+
+function emitDeclarations(tsconfigPath: string, outdir: string): boolean {
+  const configResult = ts.readConfigFile(tsconfigPath, ts.sys.readFile);
+  if (configResult.error) {
+    console.error(ts.formatDiagnosticsWithColorAndContext([configResult.error], {
+      getCurrentDirectory: ts.sys.getCurrentDirectory,
+      getCanonicalFileName: fileName => fileName,
+      getNewLine: () => ts.sys.newLine,
+    }));
+    return false;
+  }
+
+  const parsedConfig = ts.parseJsonConfigFileContent(
+    configResult.config,
+    ts.sys,
+    path.dirname(tsconfigPath),
+    {
+      declaration: true,
+      emitDeclarationOnly: true,
+      outDir: outdir,
+      declarationDir: outdir,
+      noEmit: false,
+    },
+    tsconfigPath,
+  );
+
+  const program = ts.createProgram({
+    rootNames: parsedConfig.fileNames,
+    options: parsedConfig.options,
+    projectReferences: parsedConfig.projectReferences,
+  });
+
+  const emitResult = program.emit(undefined, undefined, undefined, true);
+  const diagnostics = ts.getPreEmitDiagnostics(program).concat(emitResult.diagnostics);
+
+  if (diagnostics.length > 0) {
+    console.error(
+      ts.formatDiagnosticsWithColorAndContext(diagnostics, {
+        getCurrentDirectory: ts.sys.getCurrentDirectory,
+        getCanonicalFileName: fileName => fileName,
+        getNewLine: () => ts.sys.newLine,
+      }),
+    );
+    console.error('Declaration emit failed due to TypeScript errors.');
+    return false;
+  }
+
+  return true;
+}
+
+async function runBuild(options: {
+  project: string;
+  showDuration?: boolean;
+  listOutput?: boolean;
+  bundle?: boolean;
+  dts?: boolean;
+  format?: 'cjs' | 'esm' | 'iife';
+}) {
   try {
     const tsconfigPath = path.resolve(process.cwd(), options.project);
     const tsconfigDir = path.dirname(tsconfigPath);
@@ -79,21 +145,42 @@ async function runBuild(options: { project: string }) {
     const tsconfig = JSON.parse(stripJsonComments(tsconfigRaw));
 
     const { compilerOptions, include, exclude, files } = tsconfig;
+    const shouldBundle = options.bundle === true;
+    const format = options.format ?? moduleToFormat(compilerOptions?.module);
 
     let entryPoints: string[] = [];
     if (files) {
       entryPoints = files.map((file: string) => path.resolve(tsconfigDir, file));
     } else if (include && Array.isArray(include)) {
-      entryPoints = globSync(include, {
+      const includePatterns = include.map((pattern: string) => {
+        const absPattern = path.resolve(tsconfigDir, pattern);
+        try {
+          if (statSync(absPattern).isDirectory()) {
+            return path.join(pattern, '**/*');
+          }
+        } catch {
+          // If stat fails, fall back to the raw pattern
+        }
+        return pattern;
+      });
+
+      entryPoints = globSync(includePatterns, {
         cwd: tsconfigDir,
         ignore: exclude,
         absolute: true,
+        nodir: true,
+      }).filter(filePath => {
+        try {
+          return statSync(filePath).isFile();
+        } catch {
+          return false;
+        }
       });
 
       // If bundling, esbuild expects a single entry point.
       // If multiple entry points are found by glob, we should pick the primary one.
       // For simplicity, we'll take the first one for now.
-      if (entryPoints.length > 1) {
+      if (shouldBundle && entryPoints.length > 1) {
         // Find the main entry point if possible, e.g., 'main.ts' or 'index.ts'
         const mainEntry = entryPoints.find(ep => ep.endsWith('main.ts') || ep.endsWith('index.ts'));
         if (mainEntry) {
@@ -113,21 +200,57 @@ async function runBuild(options: { project: string }) {
       ? path.resolve(tsconfigDir, compilerOptions.outDir)
       : path.join(tsconfigDir, 'dist');
 
-    await build({
-      entryPoints,
-      outdir,
-      target: compilerOptions?.target?.toLowerCase(),
-      sourcemap: compilerOptions?.sourceMap,
-      jsx: compilerOptions?.jsx,
-      jsxFactory: compilerOptions?.jsxFactory,
-      jsxFragment: compilerOptions?.jsxFragmentFactory,
-      bundle: true,
-      platform: 'node',
-      absWorkingDir: tsconfigDir,
-      plugins: [tsconfigPathsPlugin({ tsconfigPath })],
-    });
+    const start = performance.now();
+    let result;
+    try {
+      result = await build({
+        entryPoints,
+        outdir,
+        target: compilerOptions?.target?.toLowerCase(),
+        sourcemap: compilerOptions?.sourceMap,
+        jsx: compilerOptions?.jsx,
+        jsxFactory: compilerOptions?.jsxFactory,
+        jsxFragment: compilerOptions?.jsxFragmentFactory,
+        bundle: shouldBundle,
+        platform: 'node',
+        absWorkingDir: tsconfigDir,
+        metafile: options.listOutput ?? false,
+        format,
+        plugins: [tsconfigPathsPlugin({ tsconfigPath })],
+      });
+    } catch (error: unknown) {
+      const errWithMessages = error as { errors?: any[] };
+      if (errWithMessages?.errors?.length) {
+        const formatted = await formatMessages(errWithMessages.errors, { kind: 'error', color: true });
+        console.error(formatted.join('\n'));
+      } else {
+        console.error('Build failed:', error);
+      }
+      process.exit(1);
+    }
 
-    console.log('✨ Build finished successfully!');
+    const durationMs = performance.now() - start;
+    const suffix: string[] = [];
+    if (options.showDuration) {
+      suffix.push(`⏱️ ${durationMs.toFixed(0)} ms`);
+    }
+
+    if (options.listOutput && result.metafile?.outputs) {
+      const outputs = Object.keys(result.metafile.outputs)
+        .map(outputPath => path.resolve(tsconfigDir, outputPath))
+        .sort();
+      console.log('🗂️ Outputs:');
+      outputs.forEach(output => console.log(`  • ${output}`));
+    }
+
+    if (options.dts !== false) {
+      const ok = emitDeclarations(tsconfigPath, outdir);
+      if (!ok) {
+        process.exit(1);
+      }
+    }
+
+    console.log(`✨ Build finished successfully!${suffix.length ? ` (${suffix.join(', ')})` : ''}`);
   } catch (error) {
     console.error('Build failed:', error);
     process.exit(1);
@@ -141,6 +264,19 @@ cli
   .option('-p, --project <path>', 'Path to the tsconfig.json file', {
     default: 'tsconfig.json',
   })
+  .option('--show-duration', 'Print build duration in milliseconds', {
+    default: false,
+  })
+  .option('--list-output', 'List generated output files (enables esbuild metafile)', {
+    default: false,
+  })
+  .option('--bundle', 'Bundle entry points (use --no-bundle to emit separate outputs)', {
+    default: false,
+  })
+  .option('--dts', 'Emit .d.ts files (use --no-dts to skip)', {
+    default: true,
+  })
+  .option('--format <format>', 'Output format: cjs | esm | iife (default derives from tsconfig compilerOptions.module)', {})
   .action(runBuild);
 
 cli.help();
